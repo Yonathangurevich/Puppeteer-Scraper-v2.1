@@ -1,16 +1,23 @@
-# Custom FlareSolverr with Node.js wrapper
+# Fixed Dockerfile - FlareSolverr with Chrome
 FROM python:3.11-slim
 
-# Install Node.js
+# Install Node.js and wget
 RUN apt-get update && apt-get install -y \
     curl \
     wget \
     gnupg \
+    ca-certificates \
     && curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
-    && apt-get install -y nodejs \
+    && apt-get install -y nodejs
+
+# Add Chrome repo and install Chrome
+RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
+    && echo "deb http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Chrome dependencies
+# Install additional dependencies for Chrome
 RUN apt-get update && apt-get install -y \
     fonts-liberation \
     libasound2 \
@@ -31,6 +38,8 @@ RUN apt-get update && apt-get install -y \
     libxkbcommon0 \
     libxrandr2 \
     xdg-utils \
+    libxss1 \
+    libxtst6 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -51,8 +60,12 @@ ENV CAPTCHA_SOLVER=none
 ENV BROWSER_TIMEOUT=40000
 ENV MAX_TIMEOUT=60000
 ENV PORT=8191
+# Important for Chrome in Docker
+ENV CHROME_BIN=/usr/bin/google-chrome-stable
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
 
 EXPOSE 8191
 
-# Run the Node.js wrapper which will manage FlareSolverr
+# Run the Node.js wrapper
 CMD ["node", "server.js"]
