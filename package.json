@@ -1,16 +1,17 @@
 {
-  "name": "byparr-lite",
+  "name": "flaresolverr-managed",
   "version": "1.0.0",
-  "description": "Byparr Lite wrapper for FlareSolverr",
+  "description": "FlareSolverr with automatic resource management",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "install-flaresolverr": "pip install flaresolverr",
+    "postinstall": "npm run install-flaresolverr"
   },
   "dependencies": {
     "express": "^4.18.2",
     "axios": "^1.6.2",
-    "node-cache": "^5.1.2",
-    "p-queue": "^6.6.2"
+    "node-cache": "^5.1.2"
   },
   "engines": {
     "node": ">=18.0.0"
