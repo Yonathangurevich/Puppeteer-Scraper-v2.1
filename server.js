@@ -412,6 +412,83 @@ app.get('/test-partsouq', async (req, res) => {
   }
 });
 
+// Test Partsouq with special handling
+app.get('/test-partsouq-special', async (req, res) => {
+  const url = req.query.url || 'https://partsouq.com';
+  console.log(`\n🧪 Special Partsouq test for: ${url}`);
+  
+  let browser = null;
+  let page = null;
+  
+  try {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        ...BROWSER_ARGS,
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--flag-switches-begin',
+        '--disable-site-isolation-trials',
+        '--flag-switches-end'
+      ],
+      ignoreDefaultArgs: ['--enable-automation'],
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
+    });
+    
+    page = await browser.newPage();
+    
+    // Maximum stealth
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+    });
+    
+    await page.setViewport({ width: 1920, height: 1080 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+    
+    // Try multiple strategies
+    console.log('📡 Attempt 1: Normal navigation...');
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    
+    let content = await page.content();
+    let attempts = 1;
+    
+    while (content.includes('Cloudflare') && attempts < 4) {
+      console.log(`☁️ Cloudflare detected, attempt ${attempts + 1}...`);
+      await page.waitForTimeout(5000);
+      
+      // Try to find and click any verification element
+      try {
+        await page.click('#challenge-form', { delay: 100 });
+      } catch {}
+      
+      content = await page.content();
+      attempts++;
+    }
+    
+    res.json({
+      status: 'ok',
+      url: page.url(),
+      hasCloudflare: content.includes('Cloudflare'),
+      htmlLength: content.length,
+      title: await page.title(),
+      attempts: attempts
+    });
+    
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      message: error.message
+    });
+  } finally {
+    if (page) await page.close();
+    if (browser) await browser.close();
+  }
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({
