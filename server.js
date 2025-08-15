@@ -1,273 +1,122 @@
 const express = require('express');
 const axios = require('axios');
-const crypto = require('crypto');
+const NodeCache = require('node-cache');
+const PQueue = require('p-queue').default;
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
 const PORT = process.env.PORT || 3000;
-const FLARESOLVERR_URL = process.env.FLARESOLVERR_URL || 'http://localhost:8191';
+const FLARESOLVERR_URLS = (process.env.FLARESOLVERR_URLS || '').split(',').filter(Boolean);
 
-// Session management with auto-cleanup
+// Cache - TTL 5 minutes
+const cache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
+
+// Queue - 3 concurrent requests
+const queue = new PQueue({ concurrency: 3 });
+
+// Session management
 const sessions = new Map();
 const SESSION_TTL = 120000; // 2 minutes
-const CLEANUP_INTERVAL = 30000; // Clean every 30 seconds
 
-// Response cache for identical requests
-const responseCache = new Map();
-const CACHE_TTL = 60000; // 1 minute cache
+// Round-robin load balancing
+let currentProvider = 0;
 
-// Stats
-let totalRequests = 0;
-let successfulRequests = 0;
-let failedRequests = 0;
-let cacheHits = 0;
-
-// Create session with auto-cleanup
-async function createSession() {
-  try {
-    const sessionId = crypto.randomBytes(16).toString('hex');
-    
-    const response = await axios.post(`${FLARESOLVERR_URL}/v1`, {
-      cmd: 'sessions.create',
-      session: sessionId
-    });
-    
-    if (response.data.status === 'ok') {
-      sessions.set(sessionId, {
-        created: Date.now(),
-        lastUsed: Date.now(),
-        requestCount: 0
-      });
-      
-      console.log(`✅ Session created: ${sessionId}`);
-      return sessionId;
-    }
-    
-    throw new Error('Failed to create session');
-  } catch (error) {
-    console.error('❌ Session creation failed:', error.message);
-    return null;
+function getNextProvider() {
+  if (FLARESOLVERR_URLS.length === 0) {
+    throw new Error('No FlareSolverr providers configured');
   }
-}
-
-// Destroy session
-async function destroySession(sessionId) {
-  try {
-    await axios.post(`${FLARESOLVERR_URL}/v1`, {
-      cmd: 'sessions.destroy',
-      session: sessionId
-    });
-    
-    sessions.delete(sessionId);
-    console.log(`🗑️ Session destroyed: ${sessionId}`);
-  } catch (error) {
-    console.error(`Failed to destroy session ${sessionId}:`, error.message);
-    sessions.delete(sessionId);
-  }
+  const url = FLARESOLVERR_URLS[currentProvider];
+  currentProvider = (currentProvider + 1) % FLARESOLVERR_URLS.length;
+  return url;
 }
 
 // Clean old sessions
-async function cleanupSessions() {
+setInterval(() => {
   const now = Date.now();
-  const toDelete = [];
-  
-  for (const [sessionId, data] of sessions) {
-    if (now - data.lastUsed > SESSION_TTL) {
-      toDelete.push(sessionId);
+  for (const [id, data] of sessions) {
+    if (now - data.created > SESSION_TTL) {
+      destroySession(id);
     }
   }
-  
-  if (toDelete.length > 0) {
-    console.log(`🧹 Cleaning ${toDelete.length} old sessions`);
-    for (const sessionId of toDelete) {
-      await destroySession(sessionId);
-    }
-  }
-  
-  // Clean old cache entries
-  for (const [key, data] of responseCache) {
-    if (now - data.timestamp > CACHE_TTL) {
-      responseCache.delete(key);
-    }
-  }
-}
+  console.log(`🧹 Active sessions: ${sessions.size}`);
+}, 30000);
 
-// Get or create session
-async function getSession() {
-  // Find least used session
-  let selectedSession = null;
-  let minRequests = Infinity;
-  
-  for (const [sessionId, data] of sessions) {
-    if (data.requestCount < minRequests) {
-      selectedSession = sessionId;
-      minRequests = data.requestCount;
-    }
-  }
-  
-  // Create new session if none exist or all are busy
-  if (!selectedSession || minRequests > 5) {
-    selectedSession = await createSession();
-  }
-  
-  return selectedSession;
-}
-
-// Main scraping endpoint
-app.post('/scrape', async (req, res) => {
-  const startTime = Date.now();
-  totalRequests++;
+async function destroySession(sessionId) {
+  const sessionData = sessions.get(sessionId);
+  if (!sessionData) return;
   
   try {
-    const { url, maxTimeout = 60000, waitUntil = 'load', returnOnlyCookies = false } = req.body;
+    await axios.post(`${sessionData.provider}/v1`, {
+      cmd: 'sessions.destroy',
+      session: sessionId
+    });
+  } catch (e) {
+    // ignore
+  }
+  
+  sessions.delete(sessionId);
+  console.log(`🗑️ Session destroyed: ${sessionId}`);
+}
+
+// Main endpoint
+app.post('/v1', async (req, res) => {
+  const startTime = Date.now();
+  
+  try {
+    const { cmd, url, session: requestSession } = req.body;
     
-    if (!url) {
-      return res.status(400).json({
-        status: 'error',
-        message: 'URL is required'
-      });
-    }
-    
-    console.log(`\n📥 Request: ${url}`);
-    
-    // Check cache
-    const cacheKey = `${url}_${waitUntil}`;
-    if (responseCache.has(cacheKey)) {
-      const cached = responseCache.get(cacheKey);
-      if (Date.now() - cached.timestamp < CACHE_TTL) {
-        cacheHits++;
-        console.log('⚡ Cache hit!');
+    // Check cache for GET requests
+    if (cmd === 'request.get' && url) {
+      const cached = cache.get(url);
+      if (cached) {
+        console.log(`⚡ Cache hit for: ${url}`);
         return res.json({
-          ...cached.data,
+          ...cached,
           fromCache: true,
           elapsed: Date.now() - startTime
         });
       }
     }
     
-    // Get or create session
-    const sessionId = await getSession();
-    if (!sessionId) {
-      throw new Error('Could not create session');
-    }
-    
-    // Update session stats
-    const sessionData = sessions.get(sessionId);
-    sessionData.requestCount++;
-    sessionData.lastUsed = Date.now();
-    
-    console.log(`🔄 Using session: ${sessionId} (request #${sessionData.requestCount})`);
-    
-    // Make request to FlareSolverr
-    const response = await axios.post(`${FLARESOLVERR_URL}/v1`, {
-      cmd: 'request.get',
-      url: url,
-      session: sessionId,
-      maxTimeout: maxTimeout,
-      cookies: [],
-      returnOnlyCookies: returnOnlyCookies,
-      proxy: {}
-    }, {
-      timeout: maxTimeout + 5000
-    });
-    
-    if (response.data.status === 'ok') {
-      successfulRequests++;
-      const elapsed = Date.now() - startTime;
+    // Execute with queue
+    const result = await queue.add(async () => {
+      const provider = getNextProvider();
+      console.log(`🔄 Using provider: ${provider}`);
       
-      console.log(`✅ Success in ${elapsed}ms`);
-      console.log(`📊 HTML size: ${response.data.solution.response?.length || 0} bytes`);
-      
-      // Cache successful response
-      const responseData = {
-        status: 'ok',
-        solution: response.data.solution,
-        startTimestamp: response.data.startTimestamp,
-        endTimestamp: response.data.endTimestamp,
-        version: response.data.version
-      };
-      
-      responseCache.set(cacheKey, {
-        data: responseData,
-        timestamp: Date.now()
-      });
-      
-      // Destroy session if it has been used too much
-      if (sessionData.requestCount >= 10) {
-        console.log(`♻️ Recycling session after ${sessionData.requestCount} requests`);
-        setTimeout(() => destroySession(sessionId), 1000);
+      // Handle session commands
+      if (cmd === 'sessions.create') {
+        const sessionId = requestSession || 'auto_' + Date.now();
+        sessions.set(sessionId, {
+          provider,
+          created: Date.now()
+        });
       }
       
-      res.json({
-        ...responseData,
-        elapsed: elapsed
+      // Make request
+      const response = await axios.post(`${provider}/v1`, req.body, {
+        timeout: 65000
       });
       
-    } else {
-      throw new Error(response.data.message || 'Unknown error');
-    }
-    
-  } catch (error) {
-    failedRequests++;
-    console.error('❌ Error:', error.message);
-    
-    res.status(500).json({
-      status: 'error',
-      message: error.message,
-      solution: null
-    });
-  }
-});
-
-// Batch scraping endpoint
-app.post('/scrape-batch', async (req, res) => {
-  try {
-    const { urls, maxTimeout = 60000 } = req.body;
-    
-    if (!urls || !Array.isArray(urls)) {
-      return res.status(400).json({
-        status: 'error',
-        message: 'URLs array is required'
-      });
-    }
-    
-    console.log(`\n📦 Batch request for ${urls.length} URLs`);
-    
-    const results = [];
-    
-    // Process URLs in parallel with limit
-    const batchSize = 3;
-    for (let i = 0; i < urls.length; i += batchSize) {
-      const batch = urls.slice(i, i + batchSize);
-      
-      const batchResults = await Promise.allSettled(
-        batch.map(url => 
-          axios.post(`http://localhost:${PORT}/scrape`, {
-            url,
-            maxTimeout
-          })
-        )
-      );
-      
-      for (const result of batchResults) {
-        if (result.status === 'fulfilled') {
-          results.push(result.value.data);
-        } else {
-          results.push({
-            status: 'error',
-            message: result.reason.message
-          });
-        }
+      // Cache successful GET requests
+      if (cmd === 'request.get' && response.data.status === 'ok') {
+        cache.set(url, response.data);
+        console.log(`💾 Cached: ${url}`);
       }
-    }
+      
+      return response.data;
+    });
+    
+    const elapsed = Date.now() - startTime;
+    console.log(`✅ Request completed in ${elapsed}ms`);
     
     res.json({
-      status: 'ok',
-      results: results
+      ...result,
+      elapsed
     });
     
   } catch (error) {
+    console.error('❌ Error:', error.message);
     res.status(500).json({
       status: 'error',
       message: error.message
@@ -275,114 +124,46 @@ app.post('/scrape-batch', async (req, res) => {
   }
 });
 
-// Direct proxy to FlareSolverr (for compatibility)
-app.post('/v1', async (req, res) => {
-  try {
-    const response = await axios.post(`${FLARESOLVERR_URL}/v1`, req.body);
-    res.json(response.data);
-  } catch (error) {
-    res.status(500).json({
-      status: 'error',
-      message: error.response?.data?.message || error.message
-    });
-  }
-});
-
 // Stats endpoint
 app.get('/stats', (req, res) => {
-  const stats = {
-    uptime: Math.round(process.uptime()) + 's',
-    memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
-    activeSessions: sessions.size,
-    cacheEntries: responseCache.size,
-    requests: {
-      total: totalRequests,
-      successful: successfulRequests,
-      failed: failedRequests,
-      cacheHits: cacheHits,
-      successRate: totalRequests > 0 ? 
-        Math.round((successfulRequests / totalRequests) * 100) + '%' : 'N/A'
-    }
-  };
-  
-  res.json(stats);
+  res.json({
+    providers: FLARESOLVERR_URLS.length,
+    sessions: sessions.size,
+    cacheSize: cache.keys().length,
+    queueSize: queue.size,
+    queuePending: queue.pending,
+    uptime: process.uptime()
+  });
 });
 
 // Health check
 app.get('/health', async (req, res) => {
-  try {
-    const response = await axios.get(`${FLARESOLVERR_URL}/health`);
-    res.json({
-      status: 'healthy',
-      flaresolverr: response.data,
-      wrapper: {
-        sessions: sessions.size,
-        cache: responseCache.size
-      }
-    });
-  } catch (error) {
-    res.status(503).json({
-      status: 'unhealthy',
-      error: error.message
-    });
-  }
-});
-
-// Clear all sessions
-app.post('/clear', async (req, res) => {
-  console.log('🧹 Clearing all sessions and cache');
+  const health = {
+    status: 'healthy',
+    providers: []
+  };
   
-  const sessionCount = sessions.size;
-  const cacheCount = responseCache.size;
-  
-  // Destroy all sessions
-  for (const sessionId of sessions.keys()) {
-    await destroySession(sessionId);
-  }
-  
-  // Clear cache
-  responseCache.clear();
-  
-  res.json({
-    status: 'ok',
-    cleared: {
-      sessions: sessionCount,
-      cache: cacheCount
+  for (const url of FLARESOLVERR_URLS) {
+    try {
+      await axios.get(`${url}/health`, { timeout: 5000 });
+      health.providers.push({ url, status: 'healthy' });
+    } catch (e) {
+      health.providers.push({ url, status: 'unhealthy' });
+      health.status = 'degraded';
     }
-  });
+  }
+  
+  res.json(health);
 });
 
-// Root endpoint
-app.get('/', (req, res) => {
-  res.send(`
-    <h1>🛡️ FlareSolverr Wrapper for Railway</h1>
-    <p>Optimized for performance with auto-cleanup</p>
-    <ul>
-      <li>POST /scrape - Scrape single URL</li>
-      <li>POST /scrape-batch - Scrape multiple URLs</li>
-      <li>POST /v1 - Direct FlareSolverr proxy</li>
-      <li>GET /stats - View statistics</li>
-      <li>GET /health - Health check</li>
-      <li>POST /clear - Clear all sessions</li>
-    </ul>
-    <p>Active sessions: ${sessions.size} | Cache: ${responseCache.size}</p>
-  `);
-});
-
-// Start cleanup interval
-setInterval(cleanupSessions, CLEANUP_INTERVAL);
-
-// Start server
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, () => {
   console.log(`
 ╔═══════════════════════════════════════╗
-║   🛡️ FlareSolverr Wrapper              ║
+║   🚀 Byparr Lite for Railway          ║
 ║   Port: ${PORT}                           ║
-║   FlareSolverr: ${FLARESOLVERR_URL}          ║
-║   Auto-cleanup: Enabled               ║
+║   Providers: ${FLARESOLVERR_URLS.length}                      ║
+║   Cache: Enabled (5 min)              ║
+║   Queue: 3 concurrent                 ║
 ╚═══════════════════════════════════════╝
   `);
-  
-  // Create initial session
-  createSession();
 });
