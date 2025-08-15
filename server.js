@@ -35,15 +35,15 @@ const BROWSER_ARGS = [
   '--single-process' // חשוב למהירות ב-Railway
 ];
 
-async function fastCloudflareBypass(page, url) {
-  console.log('🚀 Starting fast navigation to:', url);
+async function fastCloudflareBypass(page, url, fullScrape = false) {
+  console.log(`🚀 Starting ${fullScrape ? 'FULL SCRAPE' : 'URL ONLY'} navigation to:`, url);
   const startTime = Date.now();
   
   try {
     // Navigate פעם אחת
     await page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: 20000
+      waitUntil: fullScrape ? 'networkidle2' : 'domcontentloaded',
+      timeout: fullScrape ? 30000 : 20000
     });
     
     // בדיקה מהירה אם יש Cloudflare
@@ -53,20 +53,51 @@ async function fastCloudflareBypass(page, url) {
     if (title.includes('Just a moment') || title.includes('Checking your browser')) {
       console.log('☁️ Cloudflare detected, waiting...');
       
-      // נסה רק 3 פעמים עם המתנה קצרה
-      for (let i = 0; i < 3; i++) {
-        await page.waitForTimeout(2000); // 2 שניות במקום 3
+      if (fullScrape) {
+        // למצב FULL SCRAPE - המתנה ארוכה יותר
+        console.log('⏳ Full scrape mode - waiting longer for complete load...');
         
-        const newTitle = await page.title();
-        if (!newTitle.includes('Just a moment')) {
-          console.log(`✅ Cloudflare passed after ${i + 1} attempts`);
-          break;
+        // המתנה ראשונית ארוכה יותר
+        await page.waitForTimeout(5000);
+        
+        // נסיון להמתין לאלמנט ספציפי או שינוי בtitle
+        try {
+          await page.waitForFunction(
+            () => !document.title.includes('Just a moment'),
+            { timeout: 15000 }
+          );
+          console.log('✅ Cloudflare passed!');
+        } catch {
+          console.log('⚠️ Timeout waiting for Cloudflare, continuing anyway...');
         }
         
-        console.log(`⏳ Still waiting... (${i + 1}/3)`);
+        // המתנה נוספת כדי לוודא שהדף נטען במלואו
+        await page.waitForTimeout(3000);
+        
+      } else {
+        // למצב URL ONLY - המתנה קצרה
+        console.log('⚡ URL-only mode - quick check...');
+        
+        // נסה רק 2 פעמים עם המתנה קצרה
+        for (let i = 0; i < 2; i++) {
+          await page.waitForTimeout(2000);
+          
+          const newTitle = await page.title();
+          if (!newTitle.includes('Just a moment')) {
+            console.log(`✅ Cloudflare passed after ${i + 1} attempts`);
+            break;
+          }
+          
+          console.log(`⏳ Still waiting... (${i + 1}/2)`);
+        }
       }
     } else {
       console.log('✅ No Cloudflare detected');
+      
+      // אם זה full scrape, תן עוד קצת זמן לדף להיטען
+      if (fullScrape) {
+        await page.waitForTimeout(2000);
+      }
     }
     
     const html = await page.content();
@@ -91,9 +122,9 @@ async function fastCloudflareBypass(page, url) {
   }
 }
 
-async function scrapeWithCache(url, sessionId = null) {
+async function scrapeWithCache(url, sessionId = null, fullScrape = false) {
   // בדוק cache קודם
-  const cacheKey = `${url}_${sessionId || 'default'}`;
+  const cacheKey = `${url}_${sessionId || 'default'}_${fullScrape ? 'full' : 'url'}`;
   if (htmlCache.has(cacheKey)) {
     const cached = htmlCache.get(cacheKey);
     if (Date.now() - cached.timestamp < CACHE_TTL) {
@@ -107,7 +138,7 @@ async function scrapeWithCache(url, sessionId = null) {
     }
   }
   
-  console.log(`📦 Session: ${sessionId || 'new'}`);
+  console.log(`📦 Session: ${sessionId || 'new'} | Mode: ${fullScrape ? 'FULL SCRAPE' : 'URL ONLY'}`);
   
   let browser = null;
   let page = null;
@@ -147,8 +178,8 @@ async function scrapeWithCache(url, sessionId = null) {
       }
     }
     
-    // Fast bypass
-    const result = await fastCloudflareBypass(page, url);
+    // Fast bypass with fullScrape parameter
+    const result = await fastCloudflareBypass(page, url, fullScrape);
     
     if (result.success) {
       // Save to cache
@@ -190,7 +221,7 @@ app.post('/v1', async (req, res) => {
   const startTime = Date.now();
   
   try {
-    const { cmd, url, maxTimeout = 30000, session } = req.body;
+    const { cmd, url, maxTimeout = 30000, session, fullScrape = false } = req.body;
     
     if (!url) {
       return res.status(400).json({
@@ -199,15 +230,17 @@ app.post('/v1', async (req, res) => {
       });
     }
     
-    console.log(`\n📨 Request: ${url}`);
+    console.log(`\n🔨 Request: ${url} | Full Scrape: ${fullScrape}`);
     
     const sessionId = session || `auto_${Buffer.from(url).toString('base64').substring(0, 10)}`;
     
-    // Scrape with timeout
+    // Scrape with timeout - מאפשר יותר זמן ל-full scrape
+    const timeout = fullScrape ? maxTimeout * 2 : maxTimeout;
+    
     const result = await Promise.race([
-      scrapeWithCache(url, sessionId),
+      scrapeWithCache(url, sessionId, fullScrape),
       new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Timeout')), maxTimeout)
+        setTimeout(() => reject(new Error('Timeout')), timeout)
       )
     ]);
     
@@ -227,7 +260,7 @@ app.post('/v1', async (req, res) => {
         },
         startTimestamp: startTime,
         endTimestamp: Date.now(),
-        version: '2.0.0'
+        version: '2.1.0'
       });
     } else {
       throw new Error(result.error);
@@ -245,7 +278,8 @@ app.post('/v1', async (req, res) => {
 // Test endpoint
 app.get('/test', async (req, res) => {
   try {
-    const result = await scrapeWithCache('https://example.com');
+    const fullScrape = req.query.full === 'true';
+    const result = await scrapeWithCache('https://example.com', null, fullScrape);
     
     if (result.success) {
       const title = result.html.match(/<title>(.*?)<\/title>/)?.[1];
@@ -253,7 +287,8 @@ app.get('/test', async (req, res) => {
         status: 'ok',
         title: title || 'No title',
         length: result.html.length,
-        fromCache: result.fromCache || false
+        fromCache: result.fromCache || false,
+        mode: fullScrape ? 'full' : 'url'
       });
     } else {
       throw new Error(result.error);
@@ -271,11 +306,12 @@ app.get('/test', async (req, res) => {
 app.get('/test-partsouq', async (req, res) => {
   try {
     const vin = req.query.vin || 'NLHBB51CBEZ258560';
+    const fullScrape = req.query.full === 'true';
     const url = `https://partsouq.com/en/search/all?q=${vin}`;
     
-    console.log(`\n🧪 Testing Partsouq with VIN: ${vin}`);
+    console.log(`\n🧪 Testing Partsouq with VIN: ${vin} | Full: ${fullScrape}`);
     
-    const result = await scrapeWithCache(url, `partsouq_${vin}`);
+    const result = await scrapeWithCache(url, `partsouq_${vin}`, fullScrape);
     
     if (result.success) {
       const hasProducts = result.html.includes('product') || 
@@ -288,7 +324,8 @@ app.get('/test-partsouq', async (req, res) => {
         length: result.html.length,
         hasProducts: hasProducts,
         url: result.url,
-        fromCache: result.fromCache || false
+        fromCache: result.fromCache || false,
+        mode: fullScrape ? 'full' : 'url'
       });
     } else {
       throw new Error(result.error);
@@ -331,10 +368,10 @@ app.post('/clear-cache', (req, res) => {
 // Root
 app.get('/', (req, res) => {
   res.send(`
-    <h1>⚡ Fast Puppeteer Scraper v2</h1>
-    <p>Optimized for speed with caching</p>
+    <h1>⚡ Fast Puppeteer Scraper v2.1</h1>
+    <p>Optimized for speed with dual-mode operation</p>
     <ul>
-      <li>POST /v1 - Main endpoint</li>
+      <li>POST /v1 - Main endpoint (add fullScrape: true for complete scraping)</li>
       <li>GET /test - Test example.com</li>
       <li>GET /test-partsouq - Test Partsouq</li>
       <li>GET /health - System status</li>
@@ -347,11 +384,11 @@ app.get('/', (req, res) => {
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
-╔═══════════════════════════════════════╗
-║   ⚡ Fast Cloudflare Bypass v2        ║
+╔════════════════════════════════════════╗
+║   ⚡ Fast Cloudflare Bypass v2.1       ║
 ║   Port: ${PORT}                           ║
-║   Strategy: 3 attempts + Cache        ║
-╚═══════════════════════════════════════╝
+║   Modes: URL-only / Full Scrape       ║
+╚════════════════════════════════════════╝
   `);
 });
 
