@@ -40,62 +40,101 @@ async function fastCloudflareBypass(page, url, fullScrape = false) {
   const startTime = Date.now();
   
   try {
-    // Navigate פעם אחת
-    await page.goto(url, {
-      waitUntil: fullScrape ? 'networkidle2' : 'domcontentloaded',
-      timeout: fullScrape ? 30000 : 20000
+    // Enhanced headers for Partsouq
+    await page.setExtraHTTPHeaders({
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'DNT': '1',
+      'Connection': 'keep-alive',
+      'Upgrade-Insecure-Requests': '1'
     });
     
+    // Navigate with better strategy
+    const response = await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: fullScrape ? 60000 : 30000
+    });
+    
+    console.log(`📊 Response status: ${response?.status()}`);
+    
     // בדיקה מהירה אם יש Cloudflare
-    const title = await page.title();
+    let title = await page.title();
     console.log(`📄 Initial title: ${title}`);
     
-    if (title.includes('Just a moment') || title.includes('Checking your browser')) {
-      console.log('☁️ Cloudflare detected, waiting...');
+    if (title.includes('Just a moment') || title.includes('Checking your browser') || title.includes('Cloudflare')) {
+      console.log('☁️ Cloudflare detected, handling challenge...');
       
-      if (fullScrape) {
-        // למצב FULL SCRAPE - המתנה ארוכה יותר
-        console.log('⏳ Full scrape mode - waiting longer for complete load...');
+      // Strategy 1: Wait for Cloudflare scripts to run
+      try {
+        // חכה שה-Cloudflare יסיים לרוץ
+        await page.waitForFunction(
+          () => {
+            // בדוק אם יש את הטקסט של Cloudflare
+            const text = document.body?.innerText || '';
+            return !text.includes('Checking your browser') && 
+                   !text.includes('Just a moment') &&
+                   !document.title.includes('Just a moment');
+          },
+          { timeout: 20000, polling: 500 }
+        );
+        console.log('✅ Cloudflare challenge resolved!');
+      } catch (e) {
+        console.log('⏳ Still in Cloudflare, trying alternative method...');
         
-        // המתנה ראשונית ארוכה יותר
-        await page.waitForTimeout(5000);
-        
-        // נסיון להמתין לאלמנט ספציפי או שינוי בtitle
+        // Strategy 2: Click if there's a button/checkbox
         try {
-          await page.waitForFunction(
-            () => !document.title.includes('Just a moment'),
-            { timeout: 15000 }
-          );
-          console.log('✅ Cloudflare passed!');
-        } catch {
-          console.log('⚠️ Timeout waiting for Cloudflare, continuing anyway...');
-        }
+          // נסה למצוא ולללחוץ על checkbox או כפתור
+          const cfButton = await page.$('input[type="button"], input[type="submit"], .cf-browser-verification');
+          if (cfButton) {
+            await cfButton.click();
+            console.log('🖱️ Clicked Cloudflare element');
+            await page.waitForTimeout(3000);
+          }
+        } catch {}
         
-        // המתנה נוספת כדי לוודא שהדף נטען במלואו
-        await page.waitForTimeout(3000);
-        
-      } else {
-        // למצב URL ONLY - המתנה קצרה
-        console.log('⚡ URL-only mode - quick check...');
-        
-        // נסה רק 2 פעמים עם המתנה קצרה
-        for (let i = 0; i < 2; i++) {
-          await page.waitForTimeout(2000);
+        // Strategy 3: Wait more and check periodically
+        for (let i = 0; i < 5; i++) {
+          await page.waitForTimeout(3000);
+          title = await page.title();
+          const bodyText = await page.evaluate(() => document.body?.innerText || '');
           
-          const newTitle = await page.title();
-          if (!newTitle.includes('Just a moment')) {
-            console.log(`✅ Cloudflare passed after ${i + 1} attempts`);
+          if (!title.includes('Just a moment') && 
+              !bodyText.includes('Checking your browser')) {
+            console.log(`✅ Cloudflare passed after ${(i+1)*3} seconds`);
             break;
           }
+          console.log(`⏳ Waiting for Cloudflare... (${i+1}/5)`);
           
-          console.log(`⏳ Still waiting... (${i + 1}/2)`);
+          // נסה reload אם תקוע
+          if (i === 3) {
+            console.log('🔄 Attempting reload...');
+            await page.reload({ waitUntil: 'domcontentloaded' });
+          }
         }
       }
+      
+      // Final wait for content to stabilize
+      if (fullScrape) {
+        console.log('⏳ Waiting for full page load...');
+        try {
+          await page.waitForSelector('.product-item, .part-number, .search-results, body', { 
+            timeout: 10000 
+          });
+        } catch {
+          console.log('⚠️ Could not find expected elements, continuing...');
+        }
+        await page.waitForTimeout(2000);
+      }
+      
     } else {
       console.log('✅ No Cloudflare detected');
       
       // אם זה full scrape, תן עוד קצת זמן לדף להיטען
       if (fullScrape) {
+        try {
+          await page.waitForLoadState('networkidle');
+        } catch {}
         await page.waitForTimeout(2000);
       }
     }
@@ -104,7 +143,13 @@ async function fastCloudflareBypass(page, url, fullScrape = false) {
     const finalUrl = page.url();
     const elapsed = Date.now() - startTime;
     
+    // בדוק אם עדיין ב-Cloudflare
+    if (html.includes('cf-browser-verification') || html.includes('cf_clearance')) {
+      console.log('⚠️ Still showing Cloudflare page');
+    }
+    
     console.log(`⏱️ Completed in ${elapsed}ms`);
+    console.log(`📏 HTML length: ${html.length} characters`);
     
     return {
       success: true,
@@ -154,14 +199,42 @@ async function scrapeWithCache(url, sessionId = null, fullScrape = false) {
     
     page = await browser.newPage();
     
-    // Stealth measures
+    // Enhanced stealth measures for Cloudflare
     await page.evaluateOnNewDocument(() => {
+      // Remove webdriver traces
       Object.defineProperty(navigator, 'webdriver', {
         get: () => undefined
       });
-      window.chrome = { runtime: {} };
+      
+      // Add chrome object
+      window.chrome = {
+        runtime: {},
+        loadTimes: function() {},
+        csi: function() {},
+        app: {}
+      };
+      
+      // Fix plugins
       Object.defineProperty(navigator, 'plugins', {
         get: () => [1, 2, 3, 4, 5]
+      });
+      
+      // Fix permissions
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
+      
+      // Add languages
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en']
+      });
+      
+      // Fix platform
+      Object.defineProperty(navigator, 'platform', {
+        get: () => 'Win32'
       });
     });
     
