@@ -1,19 +1,13 @@
 {
-  "name": "flaresolverr-managed",
+  "name": "resource-manager",
   "version": "1.0.0",
-  "description": "FlareSolverr with automatic resource management",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "install-flaresolverr": "pip install flaresolverr",
-    "postinstall": "npm run install-flaresolverr"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
     "axios": "^1.6.2",
     "node-cache": "^5.1.2"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
