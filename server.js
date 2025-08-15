@@ -1,176 +1,139 @@
-// server.js - FlareSolverr Wrapper with Resource Management
+// server.js - Simple wrapper that connects to existing FlareSolverr
 const express = require('express');
 const axios = require('axios');
-const { spawn } = require('child_process');
 const NodeCache = require('node-cache');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-const PORT = process.env.PORT || 8191;
-const FLARESOLVERR_PORT = 8192;
-const FLARESOLVERR_URL = `http://localhost:${FLARESOLVERR_PORT}`;
+const PORT = process.env.PORT || 3000;
+// Use the FlareSolverr Docker service URL
+const FLARESOLVERR_URL = process.env.FLARESOLVERR_URL || 'https://flaresolverr-production-d07b.up.railway.app';
 
-// Cache for results - 2 minutes TTL
+// Cache - 2 minutes TTL
 const cache = new NodeCache({ stdTTL: 120, checkperiod: 30 });
 
-// Session tracking
+// Session management
 const sessions = new Map();
 const SESSION_TTL = 120000; // 2 minutes
 
-let flaresolverrProcess = null;
-let isRestarting = false;
-
-// Start FlareSolverr subprocess
-async function startFlareSolverr() {
-  console.log('🚀 Starting FlareSolverr...');
-  
-  const env = {
-    ...process.env,
-    PORT: FLARESOLVERR_PORT,
-    LOG_LEVEL: 'info',
-    LOG_HTML: 'false',
-    CAPTCHA_SOLVER: 'none',
-    BROWSER_TIMEOUT: '40000',
-    MAX_TIMEOUT: '60000',
-    TEST_URL: 'https://www.google.com'
-  };
-  
-  flaresolverrProcess = spawn('python', ['-m', 'flaresolverr'], {
-    env: env,
-    stdio: 'pipe'
-  });
-  
-  flaresolverrProcess.stdout.on('data', (data) => {
-    console.log(`FlareSolverr: ${data}`);
-  });
-  
-  flaresolverrProcess.stderr.on('data', (data) => {
-    console.error(`FlareSolverr Error: ${data}`);
-  });
-  
-  flaresolverrProcess.on('exit', (code) => {
-    console.log(`FlareSolverr exited with code ${code}`);
-    if (!isRestarting) {
-      setTimeout(startFlareSolverr, 5000);
-    }
-  });
-  
-  // Wait for FlareSolverr to be ready
-  await waitForFlareSolverr();
-  console.log('✅ FlareSolverr is ready!');
-}
-
-async function waitForFlareSolverr() {
-  for (let i = 0; i < 30; i++) {
-    try {
-      const response = await axios.get(`${FLARESOLVERR_URL}/health`);
-      if (response.status === 200) return true;
-    } catch (e) {
-      await new Promise(r => setTimeout(r, 1000));
-    }
-  }
-  throw new Error('FlareSolverr failed to start');
-}
-
-// Restart FlareSolverr if memory usage is high
-async function checkAndRestartIfNeeded() {
-  const memUsage = process.memoryUsage();
-  const memMB = Math.round(memUsage.heapUsed / 1024 / 1024);
-  
-  console.log(`📊 Memory usage: ${memMB}MB`);
-  
-  if (memMB > 1500) {
-    console.log('⚠️ High memory usage detected, restarting FlareSolverr...');
-    await restartFlareSolverr();
-  }
-}
-
-async function restartFlareSolverr() {
-  isRestarting = true;
-  
-  // Clean all sessions first
-  await cleanAllSessions();
-  
-  // Kill FlareSolverr
-  if (flaresolverrProcess) {
-    flaresolverrProcess.kill();
-    await new Promise(r => setTimeout(r, 2000));
-  }
-  
-  // Clear cache
-  cache.flushAll();
-  
-  // Restart
-  isRestarting = false;
-  await startFlareSolverr();
-}
-
-// Clean sessions
-async function cleanAllSessions() {
-  console.log('🧹 Cleaning all sessions...');
-  
-  for (const [sessionId, data] of sessions) {
-    try {
-      await axios.post(`${FLARESOLVERR_URL}/v1`, {
-        cmd: 'sessions.destroy',
-        session: sessionId
-      });
-    } catch (e) {
-      // ignore
-    }
-  }
-  
-  sessions.clear();
-  console.log('✅ All sessions cleaned');
-}
-
-// Clean old sessions periodically
+// Clean old sessions every 30 seconds
 setInterval(async () => {
   const now = Date.now();
-  const toDelete = [];
   
   for (const [sessionId, data] of sessions) {
     if (now - data.created > SESSION_TTL) {
-      toDelete.push(sessionId);
+      try {
+        await axios.post(`${FLARESOLVERR_URL}/v1`, {
+          cmd: 'sessions.destroy',
+          session: sessionId
+        });
+        sessions.delete(sessionId);
+        console.log(`🗑️ Cleaned session: ${sessionId}`);
+      } catch (e) {
+        sessions.delete(sessionId);
+      }
     }
   }
   
-  for (const sessionId of toDelete) {
-    try {
-      await axios.post(`${FLARESOLVERR_URL}/v1`, {
-        cmd: 'sessions.destroy',
-        session: sessionId
-      });
-      sessions.delete(sessionId);
-      console.log(`🗑️ Deleted old session: ${sessionId}`);
-    } catch (e) {
-      sessions.delete(sessionId);
-    }
-  }
-  
-  // Check memory
-  await checkAndRestartIfNeeded();
-  
-}, 30000); // Every 30 seconds
+  console.log(`📊 Active sessions: ${sessions.size}, Cache entries: ${cache.keys().length}`);
+}, 30000);
 
-// Main endpoint - handles complex URLs
+// Main endpoint
 app.post('/v1', async (req, res) => {
   const startTime = Date.now();
   
   try {
-    const { cmd, url, session: requestSession, maxTimeout = 60000 } = req.body;
+    const { cmd, url, session: requestSession } = req.body;
     
-    // Check cache for GET requests with complex URLs
-    if (cmd === 'request.get' && url) {
-      // Use a simpler cache key for complex URLs
-      const cacheKey = url.includes('ssd=') ? 
-        url.split('ssd=')[0] + url.split('&q=')[1] : 
-        url;
+    // Special handling for complex URLs with ssd parameter
+    if (cmd === 'request.get' && url && url.includes('ssd=')) {
+      console.log('🔗 Complex URL detected with ssd parameter');
       
+      // Create a simplified cache key
+      const vin = url.match(/q=([^&]+)/)?.[1] || '';
+      const gid = url.match(/gid=(\d+)/)?.[1] || '';
+      const cacheKey = `complex_${vin}_${gid}`;
+      
+      // Check cache
       const cached = cache.get(cacheKey);
       if (cached) {
-        console.log(`⚡ Cache hit for complex URL`);
+        console.log('⚡ Cache hit for complex URL!');
+        return res.json({
+          ...cached,
+          fromCache: true,
+          elapsed: Date.now() - startTime
+        });
+      }
+      
+      // Make request with session for complex URLs
+      let sessionId = requestSession;
+      if (!sessionId) {
+        sessionId = `auto_${Date.now()}`;
+        
+        // Create session
+        await axios.post(`${FLARESOLVERR_URL}/v1`, {
+          cmd: 'sessions.create',
+          session: sessionId
+        });
+        
+        sessions.set(sessionId, {
+          created: Date.now(),
+          requests: 0
+        });
+        
+        console.log(`📦 Created session for complex URL: ${sessionId}`);
+      }
+      
+      // Make the request
+      console.log(`🔄 Fetching complex URL with session...`);
+      const response = await axios.post(`${FLARESOLVERR_URL}/v1`, {
+        ...req.body,
+        session: sessionId
+      }, {
+        timeout: 65000
+      });
+      
+      // Update session stats
+      if (sessions.has(sessionId)) {
+        const sessionData = sessions.get(sessionId);
+        sessionData.requests++;
+        
+        // Auto-cleanup after 5 requests
+        if (sessionData.requests >= 5) {
+          setTimeout(async () => {
+            try {
+              await axios.post(`${FLARESOLVERR_URL}/v1`, {
+                cmd: 'sessions.destroy',
+                session: sessionId
+              });
+              sessions.delete(sessionId);
+              console.log(`♻️ Recycled session after ${sessionData.requests} requests`);
+            } catch (e) {}
+          }, 1000);
+        }
+      }
+      
+      // Cache successful response
+      if (response.data.status === 'ok') {
+        cache.set(cacheKey, response.data);
+        console.log(`💾 Cached complex URL response`);
+      }
+      
+      const elapsed = Date.now() - startTime;
+      console.log(`✅ Complex URL fetched in ${elapsed}ms`);
+      
+      return res.json({
+        ...response.data,
+        elapsed
+      });
+    }
+    
+    // Regular URLs - check cache
+    if (cmd === 'request.get' && url) {
+      const cached = cache.get(url);
+      if (cached) {
+        console.log('⚡ Cache hit!');
         return res.json({
           ...cached,
           fromCache: true,
@@ -179,7 +142,7 @@ app.post('/v1', async (req, res) => {
       }
     }
     
-    // Track session
+    // Track session creation
     if (cmd === 'sessions.create') {
       const sessionId = requestSession || 'auto_' + Date.now();
       sessions.set(sessionId, {
@@ -189,43 +152,16 @@ app.post('/v1', async (req, res) => {
     }
     
     // Forward to FlareSolverr
-    console.log(`🔄 Processing: ${cmd}`);
-    if (url) {
-      console.log(`📍 URL: ${url.substring(0, 100)}...`);
-    }
+    console.log(`🔄 Forwarding: ${cmd} ${url ? url.substring(0, 80) : ''}`);
     
     const response = await axios.post(`${FLARESOLVERR_URL}/v1`, req.body, {
-      timeout: maxTimeout + 5000
+      timeout: 65000
     });
     
-    // Update session stats
-    if (requestSession && sessions.has(requestSession)) {
-      const sessionData = sessions.get(requestSession);
-      sessionData.requests++;
-      
-      // Auto-destroy session after 10 requests
-      if (sessionData.requests >= 10) {
-        console.log(`♻️ Recycling session after ${sessionData.requests} requests`);
-        setTimeout(async () => {
-          try {
-            await axios.post(`${FLARESOLVERR_URL}/v1`, {
-              cmd: 'sessions.destroy',
-              session: requestSession
-            });
-            sessions.delete(requestSession);
-          } catch (e) {}
-        }, 1000);
-      }
-    }
-    
-    // Cache successful complex URL responses
+    // Cache successful GET requests
     if (cmd === 'request.get' && response.data.status === 'ok' && url) {
-      const cacheKey = url.includes('ssd=') ? 
-        url.split('ssd=')[0] + url.split('&q=')[1] : 
-        url;
-      
-      cache.set(cacheKey, response.data);
-      console.log(`💾 Cached complex URL response`);
+      cache.set(url, response.data);
+      console.log('💾 Cached response');
     }
     
     const elapsed = Date.now() - startTime;
@@ -248,17 +184,18 @@ app.post('/v1', async (req, res) => {
 // Health check
 app.get('/health', async (req, res) => {
   try {
-    const flaresolverrHealth = await axios.get(`${FLARESOLVERR_URL}/health`);
+    const response = await axios.get(`${FLARESOLVERR_URL}/health`, { timeout: 5000 });
     
     const memUsage = process.memoryUsage();
-    const memMB = Math.round(memUsage.heapUsed / 1024 / 1024);
     
     res.json({
       status: 'healthy',
-      memory: `${memMB}MB`,
-      sessions: sessions.size,
-      cacheSize: cache.keys().length,
-      flaresolverr: flaresolverrHealth.data
+      wrapper: {
+        memory: Math.round(memUsage.heapUsed / 1024 / 1024) + 'MB',
+        sessions: sessions.size,
+        cache: cache.keys().length
+      },
+      flaresolverr: 'connected'
     });
   } catch (error) {
     res.status(503).json({
@@ -273,75 +210,75 @@ app.get('/stats', (req, res) => {
   const memUsage = process.memoryUsage();
   
   res.json({
-    uptime: process.uptime(),
-    memory: {
-      heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024) + 'MB',
-      heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024) + 'MB'
-    },
+    uptime: Math.round(process.uptime()) + 's',
+    memory: Math.round(memUsage.heapUsed / 1024 / 1024) + 'MB',
     sessions: {
       active: sessions.size,
-      details: Array.from(sessions.entries()).map(([id, data]) => ({
-        id,
+      list: Array.from(sessions.entries()).map(([id, data]) => ({
+        id: id.substring(0, 20),
         age: Math.round((Date.now() - data.created) / 1000) + 's',
         requests: data.requests
       }))
     },
     cache: {
       size: cache.keys().length,
-      keys: cache.keys()
+      keys: cache.keys().slice(0, 10)
     }
   });
 });
 
 // Manual cleanup
 app.post('/cleanup', async (req, res) => {
-  await cleanAllSessions();
+  const sessionCount = sessions.size;
+  
+  for (const [sessionId] of sessions) {
+    try {
+      await axios.post(`${FLARESOLVERR_URL}/v1`, {
+        cmd: 'sessions.destroy',
+        session: sessionId
+      });
+    } catch (e) {}
+  }
+  
+  sessions.clear();
   cache.flushAll();
   
   res.json({
     status: 'ok',
-    message: 'Cleaned all sessions and cache'
+    cleaned: {
+      sessions: sessionCount,
+      cache: cache.keys().length
+    }
   });
-});
-
-// Restart FlareSolverr
-app.post('/restart', async (req, res) => {
-  res.json({ status: 'ok', message: 'Restarting FlareSolverr...' });
-  
-  setTimeout(async () => {
-    await restartFlareSolverr();
-  }, 100);
 });
 
 // Root
 app.get('/', (req, res) => {
   res.send(`
-    <h1>🛡️ FlareSolverr Managed</h1>
-    <p>Optimized for complex URLs with auto-cleanup</p>
+    <h1>🛡️ FlareSolverr Smart Wrapper</h1>
+    <p>Optimized for complex URLs with ssd parameters</p>
     <ul>
-      <li>POST /v1 - Main endpoint (FlareSolverr compatible)</li>
+      <li>POST /v1 - Main endpoint</li>
       <li>GET /health - Health check</li>
-      <li>GET /stats - Detailed statistics</li>
+      <li>GET /stats - Statistics</li>
       <li>POST /cleanup - Manual cleanup</li>
-      <li>POST /restart - Restart FlareSolverr</li>
     </ul>
-    <p>Sessions: ${sessions.size} | Cache: ${cache.keys().length}</p>
+    <p>
+      Sessions: ${sessions.size} | 
+      Cache: ${cache.keys().length} | 
+      Target: ${FLARESOLVERR_URL}
+    </p>
   `);
 });
 
-// Start server
-app.listen(PORT, '0.0.0.0', async () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔═══════════════════════════════════════╗
-║   🛡️ FlareSolverr Managed             ║
+║   🛡️ FlareSolverr Smart Wrapper       ║
 ║   Port: ${PORT}                           ║
+║   Target: ${FLARESOLVERR_URL.substring(0, 30)}...   ║
+║   Complex URL Support: ✅             ║
 ║   Auto-cleanup: Every 30s             ║
-║   Session TTL: 2 minutes              ║
-║   Cache TTL: 2 minutes                ║
-║   Auto-restart: At 1.5GB RAM          ║
 ╚═══════════════════════════════════════╝
   `);
-  
-  // Start FlareSolverr
-  await startFlareSolverr();
 });
